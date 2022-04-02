@@ -12,8 +12,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from timm.models.layers import trunc_normal_
 
-from .swin_transformer import SwinTransformer
+from .swin_transformer import SwinTransformer, BasicLayer
 from .vision_transformer import VisionTransformer
+
+from hog import hog
 
 
 class SwinTransformerForSimMIM(SwinTransformer):
@@ -24,6 +26,9 @@ class SwinTransformerForSimMIM(SwinTransformer):
 
         self.mask_token = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
         trunc_normal_(self.mask_token, mean=0., std=.02)
+        self.norm = nn.ModuleList(
+            nn.LayerNorm(96 * 2 ** i) for i in range(4)
+        )
 
     def forward(self, x, mask):
         x = self.patch_embed(x)
@@ -39,15 +44,14 @@ class SwinTransformerForSimMIM(SwinTransformer):
             x = x + self.absolute_pos_embed
         x = self.pos_drop(x)
 
+        outputs = []
+        norm_idx = 0
         for layer in self.layers:
             x = layer(x)
-        x = self.norm(x)
+            outputs.append(self.norm[norm_idx](x))
+            norm_idx += 1
 
-        x = x.transpose(1, 2)
-        B, C, L = x.shape
-        H = W = int(L ** 0.5)
-        x = x.reshape(B, C, H, W)
-        return x
+        return outputs
 
     @torch.jit.ignore
     def no_weight_decay(self):
@@ -94,6 +98,13 @@ class VisionTransformerForSimMIM(VisionTransformer):
         x = x.permute(0, 2, 1).reshape(B, C, H, W)
         return x
 
+def trans_tensor(x: torch.Tensor):
+    x = x.transpose(1, 2)
+    B, C, L = x.shape
+    H = W = int(L ** 0.5)
+    x = x.reshape(B, C, H, W)
+    return x
+
 
 class SimMIM(nn.Module):
     def __init__(self, encoder, encoder_stride):
@@ -101,22 +112,23 @@ class SimMIM(nn.Module):
         self.encoder = encoder
         self.encoder_stride = encoder_stride
 
-        self.decoder = nn.Sequential(
-            nn.Conv2d(
+        self.decoder_stage_4 = nn.Conv2d(
                 in_channels=self.encoder.num_features,
-                out_channels=self.encoder_stride ** 2 * 3, kernel_size=1),
-            nn.PixelShuffle(self.encoder_stride),
-        )
+                out_channels=27, kernel_size=1)
+
+        self.net = BasicLayer(96, [24, 24], 6, 3, 6)  # 这里根据实际情况设置参数即可，测试使用的参数是BasicLayer(192, [12, 12], 6, 3, 6)
 
         self.in_chans = self.encoder.in_chans
         self.patch_size = self.encoder.patch_size
 
     def forward(self, x, mask):
-        z = self.encoder(x, mask)
-        x_rec = self.decoder(z)
-
-        mask = mask.repeat_interleave(self.patch_size, 1).repeat_interleave(self.patch_size, 2).unsqueeze(1).contiguous()
-        loss_recon = F.l1_loss(x, x_rec, reduction='none')
+        z = self.encoder(x, mask)[-1]  # 这里的z是四个stage输出的list  [stage_1_out, stage_2_out, ...]
+        z = trans_tensor(z)     # trans_tensor是把B, L, C转成B, C, W, H, 这里 L = H * W, 转换的时机是transformer做完后，需要conv或者计算loss时，先调用这个函数转换维度
+        x_rec = self.decoder_stage_4(z)
+        hog_stage_4 = hog(x, 9, 32)     # hog(tensor, bin_size, hog_cell_size)，改hog cell size相当于改下采样倍数，相当于改scale
+        
+        mask = mask[:, None, ::8, ::8]  # mask可以直接改切片步长，从而实现得到不同size的mask（因为在生成时使用了repeat，步长内的mask是相通的）
+        loss_recon = F.l1_loss(hog_stage_4, x_rec, reduction='none')
         loss = (loss_recon * mask).sum() / (mask.sum() + 1e-5) / self.in_chans
         return loss
 
