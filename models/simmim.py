@@ -12,8 +12,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from timm.models.layers import trunc_normal_
 
-from .swin_transformer import SwinTransformer
+from .swin_transformer import SwinTransformer, BasicLayer
 from .vision_transformer import VisionTransformer
+
+from hog import hog
 
 
 class SwinTransformerForSimMIM(SwinTransformer):
@@ -104,9 +106,18 @@ class SimMIM(nn.Module):
         self.decoder = nn.Sequential(
             nn.Conv2d(
                 in_channels=self.encoder.num_features,
-                out_channels=self.encoder_stride ** 2 * 3, kernel_size=1),
-            nn.PixelShuffle(self.encoder_stride),
+                out_channels=27, kernel_size=1),
+            # nn.PixelShuffle(self.encoder_stride),
         )
+
+        self.fake_decoder = nn.Sequential(
+            nn.Conv2d(
+                in_channels=192,
+                out_channels=27, kernel_size=1
+            )
+        )
+
+        self.neck = BasicLayer(192, input_resolution=[12, 12], depth=6, num_heads=12, window_size=6)
 
         self.in_chans = self.encoder.in_chans
         self.patch_size = self.encoder.patch_size
@@ -114,10 +125,22 @@ class SimMIM(nn.Module):
     def forward(self, x, mask):
         z = self.encoder(x, mask)
         x_rec = self.decoder(z)
+        hog_label = hog(x, 9, 32)
+        fake_x = torch.zeros((256, 144, 192), device=x.device)
+        out = self.neck(fake_x)
+        B, L, C = out.shape
+        H = W = int(L ** 0.5)
+        out = out.permute(0, 2, 1).reshape(B, C, H, W)
+        out = self.fake_decoder(out)
+        fake_label = hog(x, 9, 16)
 
-        mask = mask.repeat_interleave(self.patch_size, 1).repeat_interleave(self.patch_size, 2).unsqueeze(1).contiguous()
-        loss_recon = F.l1_loss(x, x_rec, reduction='none')
-        loss = (loss_recon * mask).sum() / (mask.sum() + 1e-5) / self.in_chans
+        # mask = mask.repeat_interleave(self.patch_size, 1).repeat_interleave(self.patch_size, 2).unsqueeze(1).contiguous()
+        loss_recon = F.l1_loss(hog_label, x_rec, reduction='none')
+        loss_fake = F.l1_loss(fake_label, out, reduction='none')
+        mask_1 = mask[:, None, ::8, ::8]
+        loss = (loss_recon * mask_1).sum() / (mask_1.sum() + 1e-5) / self.in_chans
+        mask_2 = mask[:, None, ::4, ::4]
+        loss += (loss_fake * mask_2).sum() / (mask_2.sum() + 1e-5) / self.in_chans
         return loss
 
     @torch.jit.ignore
