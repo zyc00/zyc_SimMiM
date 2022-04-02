@@ -122,10 +122,11 @@ class SimMIM(nn.Module):
         self.patch_size = self.encoder.patch_size
 
     def forward(self, x, mask):
-        z = self.encoder(x, mask)[-1]  # 这里的z是四个stage输出的list  [stage_1_out, stage_2_out, ...]
-        z = trans_tensor(z)     # trans_tensor是把B, L, C转成B, C, W, H, 这里 L = H * W, 转换的时机是transformer做完后，需要conv或者计算loss时，先调用这个函数转换维度
+        output = self.encoder(x, mask)  # 这里的z是四个stage输出的list  [stage_1_out, stage_2_out, ...]
+        z = trans_tensor(output[-1])     # trans_tensor是把B, L, C转成B, C, W, H, 这里 L = H * W, 转换的时机是transformer做完后，需要conv或者计算loss时，先调用这个函数转换维度
         x_rec = self.decoder_stage_4(z)
         hog_stage_4 = hog(x, 9, 32)     # hog(tensor, bin_size, hog_cell_size)，改hog cell size相当于改下采样倍数，相当于改scale
+        z_2 = output[2]
         
         mask = mask[:, None, ::8, ::8]  # mask可以直接改切片步长，从而实现得到不同size的mask（因为在生成时使用了repeat，步长内的mask是相通的）
         loss_recon = F.l1_loss(hog_stage_4, x_rec, reduction='none')
