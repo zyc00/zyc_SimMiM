@@ -115,8 +115,12 @@ class SimMIM(nn.Module):
         self.decoder_stage_4 = nn.Conv2d(
                 in_channels=self.encoder.num_features,
                 out_channels=27, kernel_size=1)
+        self.decoder_stage_2 = nn.Conv2d(
+            in_channels=192, out_channels=27, kernel_size=1
+        )
+        self.down_sample = nn.Linear(384, 192)
 
-        self.net = BasicLayer(96, [24, 24], 6, 3, 6)  # 这里根据实际情况设置参数即可，测试使用的参数是BasicLayer(192, [12, 12], 6, 3, 6)
+        self.neck = BasicLayer(192, input_resolution=[12, 12], depth=6, num_heads=12, window_size=6)
 
         self.in_chans = self.encoder.in_chans
         self.patch_size = self.encoder.patch_size
@@ -126,11 +130,19 @@ class SimMIM(nn.Module):
         z = trans_tensor(output[-1])     # trans_tensor是把B, L, C转成B, C, W, H, 这里 L = H * W, 转换的时机是transformer做完后，需要conv或者计算loss时，先调用这个函数转换维度
         x_rec = self.decoder_stage_4(z)
         hog_stage_4 = hog(x, 9, 32)     # hog(tensor, bin_size, hog_cell_size)，改hog cell size相当于改下采样倍数，相当于改scale
-        z_2 = output[2]
+        z_3 = output[2]
+        z_3 = self.neck(self.down_sample(z_3))
+        z_3 = trans_tensor(z_3)
+        z_3 = self.decoder_stage_2(z_3)
+        hog_stage_3 = hog(x, 9, 16)
+
         
-        mask = mask[:, None, ::8, ::8]  # mask可以直接改切片步长，从而实现得到不同size的mask（因为在生成时使用了repeat，步长内的mask是相通的）
+        mask_1 = mask[:, None, ::8, ::8]  # mask可以直接改切片步长，从而实现得到不同size的mask（因为在生成时使用了repeat，步长内的mask是相通的）
+        mask_3 = mask[:, None, ::4, ::4]
         loss_recon = F.l1_loss(hog_stage_4, x_rec, reduction='none')
-        loss = (loss_recon * mask).sum() / (mask.sum() + 1e-5) / self.in_chans
+        loss_recon_3 = F.l1_loss(hog_stage_3, z_3, reduction='none')
+        loss = (loss_recon * mask_1).sum() / (mask_1.sum() + 1e-5) / self.in_chans
+        loss += (loss_recon_3 * mask_3).sum() / (mask_3.sum() + 1e-5) / self.in_chans
         return loss
 
     @torch.jit.ignore
